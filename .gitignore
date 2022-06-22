@@ -1,0 +1,13 @@
+# coverage.py files
+/htmlcov
+.coverage
+
+# python and IDE-related files
+**/__pycache__
+/venv
+/.idea
+
+# project specific files
+/dijon/std.dij
+/lang
+/old
