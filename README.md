@@ -8,10 +8,10 @@ Please install Git and Python 3.8+.
 ### Installation
 The following shell code will set up the project.  It will download this project from GitHub, download the language reference project into the `lang` folder, then copy `std.dij` into the `dijon` folder.
 ```commandline
-git clone https://github.com/bluesun212/pydijon
+git clone https://github.com/bluesun212/pydijon .
 mkdir lang
 cd lang
-git clone https://github.com/bluesun212/dijon
+git clone https://github.com/bluesun212/dijon .
 cd ..
 cp lang/std.dij dijon/std.dij
 ```
