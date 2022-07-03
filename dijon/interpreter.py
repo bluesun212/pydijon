@@ -1,10 +1,20 @@
+# Dijon interpreter, written by Jared Jonas
+# TODO:
+#   Add comment interpreter flags
+#       so that for example, the compiler can know which version the file is intended for
+#   Create a debugger mode
+#   remove the 'nout' variable, to be replaced with an equivalent std function
+
 from __future__ import annotations
+from typing import List, Dict, Tuple, Optional
 import sys
 
-from typing import List, Dict, Tuple, Optional
-from os import getcwd
+from dataclasses import dataclass
 from enum import Enum
+
+from os import getcwd
 from pathlib import Path
+from getch import getch
 
 
 # These are the valid identifier characters
@@ -262,14 +272,14 @@ class Trigger:
         self.name = name
         self.source = source
 
-        self.children: List[Trigger] = []
+        self.children: Dict[str, Trigger] = dict()
         self.code: List[Symbol] = []
         self.parent: Optional[Trigger] = None
 
     def add_child(self, child: Trigger):
         """Adds a nested Trigger."""
 
-        self.children.append(child)
+        self.children[child.name] = child
         child.parent = self
 
     def add_symbol(self, sym: Symbol):
@@ -400,7 +410,8 @@ class ReferenceValue(StackValue):
 class DanglingRef(ReferenceValue):
     """Represents an unresolved reference."""
 
-    pass
+    def __init__(self, name: str):
+        super().__init__(name)
 
 
 class LocatedRef(ReferenceValue):
@@ -455,7 +466,7 @@ class NumericalValue(StackValue):
     def _simplify(self):
         mult = -1 if self.num < 0 else 1  # _gcd can't handle negative numbers
         gcd = _gcd(mult*self.num, self.den)
-        self.num //= mult*gcd
+        self.num //= gcd
         self.den //= gcd
 
     def is_integer(self) -> bool:
@@ -528,26 +539,98 @@ class NumericalValue(StackValue):
 
 
 # Numerical constants
+class DefaultNumericalValue(NumericalValue):
+    def __init__(self):
+        super().__init__(0, 1)
+
+
 ZERO = NumericalValue(0, 1)
 ONE = NumericalValue(1, 1)
-DEFAULT_VALUE = ZERO
+DEFAULT_VALUE = DefaultNumericalValue()
 
 
 # Variable structure
 class Variable:
     """Representation of a variable in memory.  Contains a value and a list of children variables."""
 
-    def __init__(self):
-        self._value: StackValue = DEFAULT_VALUE
+    def __init__(self, value: StackValue = DEFAULT_VALUE):
+        self.val: StackValue = value
         self.indices: Dict[str, Variable] = dict()
 
     @property
     def value(self):
-        return self._value
+        return self.val
 
     @value.setter
     def value(self, value: StackValue):
-        self._value = value
+        self.val = value
+
+
+# Special variables
+class OutVariable(Variable):
+    def __init__(self, stream=None):
+        super().__init__()
+        if not stream:
+            stream = sys.stdout
+        self.stream = stream
+
+    @Variable.value.setter
+    def value(self, value: StackValue):
+        # Find a stack representation of the value based on its type
+        output = None
+        if isinstance(value, ReferenceValue):
+            name = value.get_name()
+            output = '?' if not name else name
+        elif isinstance(value, NumericalValue):
+            # Convert whole numbers to ASCII, otherwise print their fractional form
+            if value.is_integer() and 0 <= value.num <= 127:
+                output = chr(value.num)
+            else:
+                output = f"{value.num}/{value.den}"
+
+        if output:
+            self.stream.write(output)
+            self.stream.flush()
+
+
+class NumberOutVariable(Variable):
+    @Variable.value.setter
+    def value(self, value: StackValue):
+        if isinstance(value, NumericalValue):
+            if value.is_integer():
+                print(value.num, end='', flush=True)
+            else:
+                print(value.to_float())
+
+
+class InVariable(Variable):
+    @property
+    def value(self):
+        return NumericalValue(getch(), 1)
+
+
+class ExportVariable(Variable):
+    def __init__(self, frame: Frame):
+        super().__init__()
+        self.frame = frame
+
+    @Variable.value.setter
+    def value(self, value: StackValue):
+        if not isinstance(value, LocatedRef):
+            raise DijonException("Export must be passed a resolved reference")
+        if value not in self.frame.exports:
+            self.frame.exports.append(value)
+
+
+# Execution
+class FrameState(Enum):
+    """An enumeration that represents the states of execution a Frame can be in."""
+
+    INITIAL = 1     # The frame hasn't been run yet.
+    RUNNING = 2     # The frame is currently running code.
+    CONTINUE = 3    # The frame needs to check for dereferences.
+    BREAK = 4       # The frame needs to break to run a trigger.
+    FINISHED = 5    # Execution has completed on the frame.
 
 
 class Scope(Variable):
@@ -565,59 +648,28 @@ class Scope(Variable):
         super().__init__()
         self.parent: Optional[Scope] = parent
         self.trigger: Trigger = trigger
+        self.dynamic_triggers: Dict[str, TriggerCall] = dict()
+
+    def find_trigger(self, name: str) -> Optional[TriggerCall]:
+        """
+        Finds the trigger, either static or dynamic, by name in this scope
+        :param name: the trigger name
+        :return: a TriggerCall instance representing the trigger if found, else None
+        """
+
+        tc = self.dynamic_triggers.get(name)
+        if not tc:
+            tr = self.trigger.children.get(name)
+            if tr:
+                tc = TriggerCall(tr, self)
+
+        return tc
 
 
-# Special variables
-class OutVariable(Variable):
-    @Variable.value.setter
-    def value(self, value: StackValue):
-        # Find a stack representation of the value based on its type
-        output = None
-        if isinstance(value, ReferenceValue):
-            output = '?' if not value.name else value.name
-        elif isinstance(value, NumericalValue):
-            # Convert whole numbers to ASCII, otherwise print their fractional form
-            if value.is_integer() and 0 <= value.num <= 127:
-                output = chr(value.num)
-            else:
-                output = f"{value.num}/{value.den}"
-
-        if output:
-            print(output, end='', flush=True)
-
-
-class NumberOutVariable(Variable):
-    @Variable.value.setter
-    def value(self, value: StackValue):
-        if isinstance(value, NumericalValue):
-            if value.is_integer():
-                print(value.num, end='', flush=True)
-            else:
-                print(value.to_float())
-
-
-class ExportVariable(Variable):
-    def __init__(self, frame: Frame):
-        super().__init__()
-        self.frame = frame
-
-    @Variable.value.setter
-    def value(self, value: StackValue):
-        if not isinstance(value, LocatedRef):
-            raise DijonException("export must be passed a resolved reference")
-        if value not in self.frame.exports:
-            self.frame.exports.append(value)
-
-
-# Execution
-class FrameState(Enum):
-    """An enumeration that represents the states of execution a Frame can be in."""
-
-    INITIAL = 1     # The frame hasn't been run yet.
-    RUNNING = 2     # The frame is currently running code.
-    CONTINUE = 3    # The frame needs to check for dereferences.
-    BREAK = 4       # The frame needs to break to run a trigger.
-    FINISHED = 5    # Execution has completed on the frame.
+@dataclass
+class TriggerCall:
+    trigger: Trigger
+    parent_scope: Scope
 
 
 # Represents the state of reference objects
@@ -646,11 +698,11 @@ class Frame:
         self.last_op = None
 
         # Import/export fields - Only set for the root frame of a file
-        self.exports: List[LocatedRef] = []
-        self.imported_triggers: Dict[str, Tuple[Trigger, Scope]] = dict()
+        self.exports: Optional[List[LocatedRef]] = None
 
         # Ensure trigger variables exist
-        for child in trigger.children:
+        # TODO: Delete if unnecessary
+        for child in trigger.children.values():
             self.get_ref_var(DanglingRef(child.name), True)
 
     def execute(self):
@@ -671,7 +723,7 @@ class Frame:
             # Handle one trigger call
             if len(self.stack_ref_states) > 0:
                 tup = self.stack_ref_states.pop()
-                self.branch = Frame(tup[2][1], tup[2][0])
+                self.branch = Frame(tup[2].parent_scope, tup[2].trigger)
                 self.stack_ref_states.append((tup[0], STATE_DEREF))
                 self.state = FrameState.BREAK
                 # TODO: Implement tail call optimization
@@ -711,11 +763,13 @@ class Frame:
 
         if isinstance(sv, ReferenceValue):
             # Find the trigger depending on the reference type
+            search_frame = self
             trigger = None
-            if isinstance(sv, LocatedRef) and sv.callee_frame:
-                trigger = sv.callee_frame.find_trigger(sv.name)
-            elif isinstance(sv, DanglingRef):
-                trigger = self.find_trigger(sv.name)
+            if isinstance(sv, LocatedRef):
+                search_frame = sv.callee_frame
+
+            if search_frame:
+                trigger = search_frame.find_trigger(sv.get_name())
 
             if trigger:  # A trigger exists, so we need to break to run it
                 self.stack_ref_states.append((-index, STATE_TRIGGER, trigger))
@@ -764,27 +818,22 @@ class Frame:
 
         return var
 
-    def find_trigger(self, name: str) -> Optional[Tuple[Trigger, Scope]]:
+    def find_trigger(self, name: str) -> Optional[TriggerCall]:
         """
         Finds the trigger matching the given name
         :param name: the name of the trigger
         :return: A tuple containing the Trigger object and its associated Scope, if it exists, None otherwise
         """
 
-        scope = self.scope
-
         # Iterate through triggers, starting with this scope's children
         # Look for triggers matching this name, except not the currently executing trigger
+        scope = self.scope
         while scope is not None:
-            for child in scope.trigger.children:
-                if child.name == name and child != self.scope.trigger:
-                    return child, scope
+            tc = scope.find_trigger(name)
+            if tc and tc.trigger is not self.scope.trigger:
+                return tc
 
             scope = scope.parent
-
-        # Look through the imported triggers
-        if name in self.imported_triggers:
-            return self.imported_triggers[name]
 
         return None
 
@@ -819,10 +868,16 @@ class Frame:
 
 class Interpreter:
     """The main Dijon interpreter.  Code is imported and ran here."""
+    version = (1, 1, 0)  # The current version of the interpreter (major, minor, build)
 
     def __init__(self):
         self.frames: List[Frame] = []
+        self.error_occurred = False
         self.imported_frames: Dict[Path, Frame] = dict()
+
+        # Builtins
+        from int_builtins import generate_builtins
+        self.builtins = generate_builtins(self)
 
         # Import path resolution
         self.path_list = [Path(getcwd())]
@@ -851,18 +906,22 @@ class Interpreter:
         return self._run(code=code)
 
     def _resolve_import(self, name: str, calling_path: Path) -> Frame:
+        # Handle builtin import
+        if name == "__builtin":
+            return self.builtins
+
         # Create list of base paths to start with
         possible_paths = list(self.path_list)
         possible_paths.append(calling_path)
         resolved_path = None
 
         for base_path in possible_paths:
-            # Go up directories if two dots are in front of path
+            # Go up directories depending on number of dots in front of path
             curr_name = name
-            while curr_name.startswith('..'):
-                base_path = base_path.parent
-                curr_name = curr_name[2:]
             if curr_name.startswith('.'):
+                curr_name = curr_name[1:]
+            while curr_name.startswith('.'):
+                base_path = base_path.parent
                 curr_name = curr_name[1:]
 
             # Add .dij to the end and split the path at the periods
@@ -909,47 +968,56 @@ class Interpreter:
 
         # Set up the root frame and add special reserved variables
         frame = Frame(None, sf.root_trigger)
+        frame.exports = []
+
+        # TODO: Move to builtins?
         frame.scope.indices["out"] = OutVariable()
         frame.scope.indices["nout"] = NumberOutVariable()
+        frame.scope.indices["in"] = InVariable()
         frame.scope.indices["export"] = ExportVariable(frame)
 
-        self.frames.append(frame)
-        self.imported_frames[path] = frame
+        if path:  # Add this frame to import list
+            self.imported_frames[path] = frame
 
-        # Import all prerequisite files and their exported variables/trigger
+        # Import all prerequisite files and their exported variables/triggers
         for imp in sf.imports:
             imp_frame = self._resolve_import(imp, path)
             global_flag = imp in sf.global_imports
             imp_var = Variable()
 
             for exp in imp_frame.exports:
-                # Add imported variable and a global alias if applicable
-                imp_var.indices[exp.name] = exp.ref
+                # Add imported variable or a global alias if applicable
+                base_var = imp_var
                 if global_flag:
-                    frame.scope.indices[exp.name] = exp.ref
+                    base_var = frame.scope
+                base_var.indices[exp.name] = exp.ref
 
                 # Add a link to the trigger from the imported file
                 if exp.callee_frame:
                     trigger = exp.callee_frame.find_trigger(exp.name)
                     if trigger:
-                        # Add trigger to the imported list, and an alias if the import is global
-                        frame.imported_triggers[imp + '.' + exp.name] = trigger
-                        if global_flag:
-                            frame.imported_triggers[exp.name] = trigger
+                        # Add trigger to the imported list
+                        exp_name = exp.name
+                        if not global_flag:
+                            exp_name = imp + '.' + exp_name
+
+                        frame.scope.dynamic_triggers[exp_name] = trigger
 
             # Add base imported variable to the outermost scope
-            frame.scope.indices[imp] = imp_var
+            if not global_flag:
+                frame.scope.indices[imp] = imp_var
 
         # Execute the frame
+        self.frames.append(frame)
         self._execute_until_return()
         return frame
 
     def _execute_until_return(self):
         # Run code until the starting top frame is popped
         start_len = len(self.frames)
-        while len(self.frames) >= start_len:
+        while len(self.frames) >= start_len and not self.error_occurred:
             f = self.frames[-1]
-            self._execute_safe()
+            self.error_occurred = not self._execute_safe()
 
             # Handle breaking or finished state
             if f.state == FrameState.BREAK:
@@ -957,10 +1025,11 @@ class Interpreter:
             elif f.state == FrameState.FINISHED:
                 self.frames.pop()
 
-    def _execute_safe(self):
+    def _execute_safe(self) -> bool:
         # Catch any exceptions so a proper stack trace can be shown to the user
         try:
             self.frames[-1].execute()
+            return True
         except DijonException as e:
             # Print stack trace and exit
             sys.stderr.write(f"Error: {e}\nStack trace:\n")
@@ -968,4 +1037,4 @@ class Interpreter:
                 trigger = f.scope.trigger
                 symbol = trigger.code[f.pos]
                 sys.stderr.write(f"\t{trigger.source.name}.dij@{trigger.name} {symbol.line+1}:{symbol.pos+1}\n")
-            sys.exit(1)
+            return False
