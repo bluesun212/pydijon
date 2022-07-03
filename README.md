@@ -11,7 +11,8 @@ The following shell code will set up the project.  It will download this project
 git clone https://github.com/bluesun212/pydijon
 cd pydijon
 git clone https://github.com/bluesun212/dijon lang
-cp lang/std.dij dijon/std.dij
+cd lang/make_std
+python3 make_std.py copy
 ```
 
 ### Usage
